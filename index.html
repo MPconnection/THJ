@@ -538,7 +538,7 @@ var state={
 };
 var results=null;
 var rowIdCounter=1;
-var manualSelect={bank:null, acc:null};
+var manualSelect={bank:new Set(), acc:new Set()};
 var currentFilter={matched:'', bankonly:'', acconly:''};
 var expandedAgg=new Set();
 
@@ -677,20 +677,22 @@ function buildRowsFromMapping(side){
     var amount, amountRaw, parseOk;
 
     if(mode==='split'){
-      var depositRaw=r[map.deposit], withdrawRaw=r[map.withdraw];
-      var depEmpty = depositRaw===undefined || String(depositRaw).trim()==='';
-      var witEmpty = withdrawRaw===undefined || String(withdrawRaw).trim()==='';
-      var depVal = depEmpty ? 0 : parseAmount(depositRaw);
-      var witVal = witEmpty ? 0 : parseAmount(withdrawRaw);
-      var depInvalid = !depEmpty && depVal===null;
-      var witInvalid = !witEmpty && witVal===null;
-      depVal = depVal||0; witVal = witVal||0;
+      var depRaw = r[map.deposit]===undefined ? '' : String(r[map.deposit]).trim();
+      var witRaw = r[map.withdraw]===undefined ? '' : String(r[map.withdraw]).trim();
+      var depParsed = depRaw==='' ? null : parseAmount(depRaw);
+      var witParsed = witRaw==='' ? null : parseAmount(witRaw);
+      var depInvalid = depRaw!=='' && depParsed===null;
+      var witInvalid = witRaw!=='' && witParsed===null;
+      var depIsReal = depParsed!==null && depParsed!==0; // a literal 0 means "no deposit here", not a zero-amount transaction
+      var witIsReal = witParsed!==null && witParsed!==0;
+      var depVal = depIsReal ? depParsed : 0;
+      var witVal = witIsReal ? witParsed : 0;
       amount = depVal - witVal;
       var pieces=[];
-      if(!depEmpty) pieces.push('واریز '+String(depositRaw));
-      if(!witEmpty) pieces.push('برداشت '+String(withdrawRaw));
+      if(depIsReal) pieces.push('واریز '+depRaw);
+      if(witIsReal) pieces.push('برداشت '+witRaw);
       amountRaw = pieces.join(' | ');
-      parseOk = dayNum!==null && !depInvalid && !witInvalid && (depVal!==0 || witVal!==0);
+      parseOk = dayNum!==null && !depInvalid && !witInvalid && (depIsReal || witIsReal);
     } else {
       amountRaw = r[map.amount];
       amount = parseAmount(amountRaw);
@@ -854,7 +856,7 @@ function memberListHtml(members){
 function renderResults(){
   document.getElementById('resultsArea').style.display='';
   currentFilter={matched:'', bankonly:'', acconly:''};
-  manualSelect={bank:null, acc:null};
+  manualSelect={bank:new Set(), acc:new Set()};
   expandedAgg=new Set();
   renderSummary();
   document.getElementById('panel-matched').innerHTML = panelWrapper('matched','جستجو در شرح بانک یا سند...');
@@ -946,15 +948,14 @@ function matched_html(rows){
 function onlyTableHtml(rows, emptyMsg, side){
   if(!rows.length) return '<div class="empty-state">'+emptyMsg+'</div>';
   var total=sum(rows,'amount');
-  var radioName = side==='bank' ? 'selBank' : 'selAcc';
   var html='<div class="rtable-wrap"><table class="rtable"><thead><tr>'+
     '<th></th><th>تاریخ</th><th class="amt">مبلغ</th><th>شرح</th><th>وضعیت</th>'+
     '</tr></thead><tbody>';
   rows.forEach(function(r){
-    var checked = manualSelect[side]===r.id ? 'checked' : '';
+    var checked = manualSelect[side].has(r.id) ? 'checked' : '';
     var expandBtn = r.isAggregate ? '<button class="btn-expand" onclick="toggleAggExpand('+r.id+')">'+(expandedAgg.has(r.id)?'بستن':'نمایش اجزا')+'</button>' : '';
     html+='<tr>'+
-      '<td><input type="radio" name="'+radioName+'" '+checked+' onchange="setManualSelect(\''+side+'\','+r.id+')"></td>'+
+      '<td><input type="checkbox" '+checked+' onchange="toggleManualSelect(\''+side+'\','+r.id+',this.checked)"></td>'+
       '<td class="amt">'+escapeHtml(String(r.dateRaw))+'</td>'+
       '<td class="amt">'+(r.amount!==null && r.amount!==undefined ? amtSpan(r.amount) : escapeHtml(String(r.amountRaw)))+'</td>'+
       '<td>'+escapeHtml(r.desc||'').slice(0,40)+' '+expandBtn+'</td>'+
@@ -969,39 +970,77 @@ function onlyTableHtml(rows, emptyMsg, side){
 }
 
 
+
+
 /* ===================== Manual match / undo ===================== */
-function setManualSelect(side, id){
-  manualSelect[side]=id;
+function toggleManualSelect(side, id, checked){
+  if(checked) manualSelect[side].add(id); else manualSelect[side].delete(id);
   renderManualBar();
+}
+
+function clearManualSelect(){
+  manualSelect={bank:new Set(), acc:new Set()};
+  renderManualBar();
+}
+
+function synthesizeManualGroup(rows){
+  var total = rows.reduce(function(s,r){ return s+(r.amount||0); }, 0);
+  return {
+    id: rowIdCounter++,
+    dateRaw: rows[0].dateRaw,
+    amountRaw: '',
+    desc: 'گروه دستی ('+rows.length+' ردیف)',
+    dayNum: rows[0].dayNum,
+    amount: total,
+    parseOk: true,
+    isAggregate: true,
+    members: rows
+  };
+}
+
+function sideSummaryLabel(rows, placeholder){
+  if(!rows.length) return placeholder;
+  if(rows.length===1) return fmtNum(rows[0].amount)+' — '+escapeHtml(String(rows[0].dateRaw));
+  var total = rows.reduce(function(s,r){ return s+(r.amount||0); }, 0);
+  return rows.length+' ردیف — جمع '+fmtNum(total);
 }
 
 function renderManualBar(){
   var bar=document.getElementById('manualBar');
   if(!bar) return;
-  var bankRow = manualSelect.bank!==null ? findRowById(results.bankOnly, manualSelect.bank) : null;
-  var accRow = manualSelect.acc!==null ? findRowById(results.accOnly, manualSelect.acc) : null;
-  var canMatch = bankRow && accRow;
+  var bankRows = Array.from(manualSelect.bank).map(function(id){ return findRowById(results.bankOnly, id); }).filter(Boolean);
+  var accRows = Array.from(manualSelect.acc).map(function(id){ return findRowById(results.accOnly, id); }).filter(Boolean);
+  var canMatch = bankRows.length>0 && accRows.length>0;
+  var hasSelection = bankRows.length>0 || accRows.length>0;
   bar.innerHTML=
     '<div class="manualbar-inner">'+
       '<span>تطبیق دستی:</span>'+
-      '<span class="msel">'+(bankRow? fmtNum(bankRow.amount)+' — '+escapeHtml(String(bankRow.dateRaw)) : 'یک ردیف از «فقط در بانک» انتخاب کنید')+'</span>'+
+      '<span class="msel">'+sideSummaryLabel(bankRows,'از «فقط در بانک» انتخاب کنید (چند ردیف هم می‌شود)')+'</span>'+
       '<span class="arrow">↔</span>'+
-      '<span class="msel">'+(accRow? fmtNum(accRow.amount)+' — '+escapeHtml(String(accRow.dateRaw)) : 'یک ردیف از «فقط در حسابداری» انتخاب کنید')+'</span>'+
+      '<span class="msel">'+sideSummaryLabel(accRows,'از «فقط در حسابداری» انتخاب کنید (چند ردیف هم می‌شود)')+'</span>'+
       '<button class="btn-primary" '+(canMatch?'':'disabled')+' onclick="doManualMatch()">ثبت تطبیق دستی</button>'+
+      (hasSelection ? '<button class="btn-ghost" onclick="clearManualSelect()">پاک کردن انتخاب</button>' : '')+
     '</div>';
 }
 
 function doManualMatch(){
-  var b=findRowById(results.bankOnly, manualSelect.bank);
-  var a=findRowById(results.accOnly, manualSelect.acc);
-  if(!b||!a) return;
-  results.bankOnly = results.bankOnly.filter(function(r){ return r.id!==b.id; });
-  results.accOnly = results.accOnly.filter(function(r){ return r.id!==a.id; });
+  var bankRows = Array.from(manualSelect.bank).map(function(id){ return findRowById(results.bankOnly, id); }).filter(Boolean);
+  var accRows = Array.from(manualSelect.acc).map(function(id){ return findRowById(results.accOnly, id); }).filter(Boolean);
+  if(!bankRows.length || !accRows.length) return;
+
+  var bankIds = new Set(bankRows.map(function(r){ return r.id; }));
+  var accIds = new Set(accRows.map(function(r){ return r.id; }));
+  results.bankOnly = results.bankOnly.filter(function(r){ return !bankIds.has(r.id); });
+  results.accOnly = results.accOnly.filter(function(r){ return !accIds.has(r.id); });
+
+  var b = bankRows.length===1 ? bankRows[0] : synthesizeManualGroup(bankRows);
+  var a = accRows.length===1 ? accRows[0] : synthesizeManualGroup(accRows);
   var diff = (b.dayNum!=null && a.dayNum!=null) ? Math.abs(b.dayNum-a.dayNum) : null;
   results.matched.push({ bank:b, acc:a, diffDays:diff, manual:true });
-  manualSelect={bank:null, acc:null};
+  manualSelect={bank:new Set(), acc:new Set()};
   refreshAfterChange();
 }
+
 
 function undoMatchByKey(key){
   var idx=-1;
@@ -1085,21 +1124,19 @@ function exportExcel(filename){
   });
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(accOnlyAoa), 'فقط حسابداری');
 
-  if(results.aggEnabled){
-    var aggAoa=[['شرکت تدبیر حساب جنوب — جزئیات گروه‌های تجمیعی'],[],
-      ['تاریخ گروه','مجموع گروه','تعداد ردیف در گروه','تاریخ ردیف','مبلغ ردیف','شرح ردیف']];
-    function pushGroup(r){
-      if(!r || !r.isAggregate) return;
-      r.members.forEach(function(mem){
-        aggAoa.push([String(r.dateRaw), r.amount, r.members.length, String(mem.dateRaw), mem.amount, mem.desc]);
-      });
-    }
-    results.matched.forEach(function(m){ pushGroup(m.bank); pushGroup(m.acc); });
-    results.bankOnly.forEach(pushGroup);
-    results.accOnly.forEach(pushGroup);
-    if(aggAoa.length>3){
-      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(aggAoa), 'جزئیات تجمیع');
-    }
+  var aggAoa=[['شرکت تدبیر حساب جنوب — جزئیات گروه‌های تجمیعی / دستی'],[],
+    ['تاریخ گروه','مجموع گروه','تعداد ردیف در گروه','تاریخ ردیف','مبلغ ردیف','شرح ردیف']];
+  function pushGroup(r){
+    if(!r || !r.isAggregate) return;
+    r.members.forEach(function(mem){
+      aggAoa.push([String(r.dateRaw), r.amount, r.members.length, String(mem.dateRaw), mem.amount, mem.desc]);
+    });
+  }
+  results.matched.forEach(function(m){ pushGroup(m.bank); pushGroup(m.acc); });
+  results.bankOnly.forEach(pushGroup);
+  results.accOnly.forEach(pushGroup);
+  if(aggAoa.length>3){
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(aggAoa), 'جزئیات تجمیع');
   }
 
   XLSX.writeFile(wb, fname);
@@ -1111,7 +1148,7 @@ function resetAll(){
     acc:{ rawTable:[], columnMode:'single', mapping:{date:0,amount:1,desc:2}, rows:[] }
   };
   results=null;
-  manualSelect={bank:null, acc:null};
+  manualSelect={bank:new Set(), acc:new Set()};
   currentFilter={matched:'', bankonly:'', acconly:''};
   expandedAgg=new Set();
   ['bank','acc'].forEach(function(side){
